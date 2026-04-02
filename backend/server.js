@@ -30,55 +30,182 @@ startDB();
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || 'fake_key');
 const isGeminiConfigured = !!process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'your_key_here';
 
+// Helper for Gemini Multimodal
+function fileToGenerativePart(path, mimeType) {
+    return {
+        inlineData: {
+            data: Buffer.from(fs.readFileSync(path)).toString("base64"),
+            mimeType,
+        },
+    };
+}
+
 // --- LAB REPORT UPLOAD & EXPLANATION ---
 app.post('/api/upload', upload.single('report'), async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
 
-        console.log("Running OCR with Tesseract...");
-        const { data: { text } } = await tesseract.recognize(req.file.path, 'eng');
+        console.log("Analyzing report...");
+        
+        let extractedData = {
+            hemoglobin: null,
+            glucose: null,
+            cholesterol: null,
+            rawText: ""
+        };
+
+        if (isGeminiConfigured) {
+            try {
+                console.log("Using Gemini for extraction...");
+                const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+                const prompt = `Extract medical test results (specifically Hemoglobin, Glucose, and Cholesterol). 
+                Return ONLY a JSON object with keys 'hemoglobin', 'glucose', and 'cholesterol'. 
+                Each value should be an object with:
+                - 'value': number (e.g., 14.2)
+                - 'unit': string (e.g., 'g/dL')
+                - 'meaning': a short explanation of what this specific value means for the user's health (e.g., 'Low hemoglobin may cause fatigue.')
+                - 'advice': actionable clinical or lifestyle advice to improve this value (e.g., 'Eat iron-rich foods like spinach and meat.').
+                If a test is not found, use null.`;
+                
+                const imagePart = fileToGenerativePart(req.file.path, req.file.mimetype);
+                const result = await model.generateContent([prompt, imagePart]);
+                const responseText = result.response.text();
+                
+                try {
+                    const jsonStr = responseText.replace(/```json|```/g, '').trim();
+                    const aiData = JSON.parse(jsonStr);
+                    extractedData.hemoglobin = aiData.hemoglobin;
+                    extractedData.glucose = aiData.glucose;
+                    extractedData.cholesterol = aiData.cholesterol;
+                } catch (e) {
+                    console.error("Gemini Response parsing failed. Response text:", responseText);
+                }
+            } catch (geminiError) {
+                console.error("Gemini Extraction Error (Falling back to Tesseract):", geminiError.message);
+                extractedData.error = geminiError.message;
+            }
+        }
+
+        // Fallback or Supplemental OCR with Tesseract
+        if (!extractedData.hemoglobin || !extractedData.glucose || !extractedData.cholesterol) {
+            console.log("Running Tesseract OCR fallback...");
+            const { data: { text } } = await tesseract.recognize(req.file.path, 'eng');
+            extractedData.rawText = text;
+
+            // Improved Regex: Handle potential spaces around dots or units
+            if (!extractedData.hemoglobin) {
+                const hemoMatch = text.match(/hemoglobin.*?(\d+[\s.]?\d*)/i);
+                if (hemoMatch) {
+                    const val = parseFloat(hemoMatch[1].replace(/\s/g, ''));
+                    if (!isNaN(val)) extractedData.hemoglobin = { value: val, unit: "g/dL" };
+                }
+            }
+            if (!extractedData.glucose) {
+                const glucoseMatch = text.match(/glucose.*?(\d+[\s.]?\d*)/i);
+                if (glucoseMatch) {
+                    const val = parseFloat(glucoseMatch[1].replace(/\s/g, ''));
+                    if (!isNaN(val)) extractedData.glucose = { value: val, unit: "mg/dL" };
+                }
+            }
+            if (!extractedData.cholesterol) {
+                const cholMatch = text.match(/cholesterol.*?(\d+[\s.]?\d*)/i);
+                if (cholMatch) {
+                    const val = parseFloat(cholMatch[1].replace(/\s/g, ''));
+                    if (!isNaN(val)) extractedData.cholesterol = { value: val, unit: "mg/dL" };
+                }
+            }
+        }
+
         fs.unlinkSync(req.file.path);
-
-        let hemoglobin = null;
-        let glucose = null;
-        let cholesterol = null;
-
-        const hemoMatch = text.match(/hemoglobin.*?(\d+(\.\d+)?)/i);
-        if (hemoMatch) hemoglobin = parseFloat(hemoMatch[1]);
-
-        const glucoseMatch = text.match(/glucose.*?(\d+(\.\d+)?)/i);
-        if (glucoseMatch) glucose = parseFloat(glucoseMatch[1]);
-
-        const cholMatch = text.match(/cholesterol.*?(\d+(\.\d+)?)/i);
-        if (cholMatch) cholesterol = parseFloat(cholMatch[1]);
-
-        // Mock values if nothing found to ensure demo works
-        if (!hemoglobin) hemoglobin = 11.0; 
-        if (!glucose) glucose = 150;
-        if (!cholesterol) cholesterol = 210;
 
         const results = [];
         let summary = "Lab Report Analysis:\n";
 
-        if (hemoglobin) {
-            const isLow = hemoglobin < 12;
-            const explanation = isLow ? "Your hemoglobin level is slightly low. This may indicate anemia." : "Your hemoglobin level is normal.";
-            summary += `- ${explanation}\n`;
-            results.push({ test: "Hemoglobin", value: hemoglobin, status: isLow ? "Low" : "Normal", explanation });
+        if (extractedData.hemoglobin) {
+            const val = extractedData.hemoglobin.value;
+            const isLow = val < 12;
+            const isHigh = val > 18;
+            const status = isLow ? "Low" : (isHigh ? "High" : "Normal");
+            
+            const meaning = extractedData.hemoglobin.meaning || (
+                isLow ? "Low hemoglobin may cause fatigue, shortness of breath, and pale skin." : 
+                (isHigh ? "High hemoglobin is uncommon and may indicate dehydration or bone marrow issues." : 
+                "Your hemoglobin levels are in the optimal range for oxygen transport.")
+            );
+            const advice = extractedData.hemoglobin.advice || (
+                isLow ? "Increase iron-rich foods (meat, lentils, spinach) and consult a doctor." : 
+                (isHigh ? "Hydrate well and consult a specialist to rule out underlying causes." : 
+                "Maintain your current balanced diet and stay active.")
+            );
+            
+            results.push({ 
+                test: "Hemoglobin", 
+                value: val, 
+                unit: extractedData.hemoglobin.unit || "g/dL",
+                status, 
+                explanation: `Your hemoglobin level is ${status.toLowerCase()}.`,
+                meaning,
+                advice
+            });
         }
 
-        if (glucose) {
-            const isHigh = glucose > 140;
-            const explanation = isHigh ? "Your glucose level is high. Please consult a doctor." : "Your glucose level is normal.";
-            summary += `- ${explanation}\n`;
-            results.push({ test: "Glucose", value: glucose, status: isHigh ? "High" : "Normal", explanation });
+        if (extractedData.glucose) {
+            const val = extractedData.glucose.value;
+            const isLow = val < 70;
+            const isHigh = val > 140;
+            const status = isLow ? "Low" : (isHigh ? "High" : "Normal");
+            
+            const meaning = extractedData.glucose.meaning || (
+                isLow ? "Low glucose (hypoglycemia) can cause dizziness and confusion." : 
+                (isHigh ? "High glucose may indicate pre-diabetes or diabetes risks." : 
+                "Your blood sugar levels are healthy and well-regulated.")
+            );
+            const advice = extractedData.glucose.advice || (
+                isLow ? "Consume fast-acting carbs (juice, honey) and consult a doctor." : 
+                (isHigh ? "Avoid refined sugars and consider a light walk after meals." : 
+                "Continue eating balanced, low-glycemic meals.")
+            );
+
+            results.push({ 
+                test: "Glucose", 
+                value: val, 
+                unit: extractedData.glucose.unit || "mg/dL",
+                status, 
+                explanation: `Your glucose level is ${status.toLowerCase()}.`,
+                meaning,
+                advice
+            });
         }
 
-        if (cholesterol) {
-            const isHigh = cholesterol > 200;
-            const explanation = isHigh ? "Your cholesterol is high. Please consult a doctor." : "Your cholesterol is normal.";
-            summary += `- ${explanation}\n`;
-            results.push({ test: "Cholesterol", value: cholesterol, status: isHigh ? "High" : "Normal", explanation });
+        if (extractedData.cholesterol) {
+            const val = extractedData.cholesterol.value;
+            const isHigh = val > 200;
+            const status = isHigh ? "High" : "Normal";
+            
+            const meaning = extractedData.cholesterol.meaning || (
+                isHigh ? "High cholesterol increases the risk of heart disease and blood clots." : 
+                "Your cholesterol levels support good cardiovascular health."
+            );
+            const advice = extractedData.cholesterol.advice || (
+                isHigh ? "Reduce saturated fats and include more fiber (oats, beans, nuts)." : 
+                "Keep up your healthy lifestyle and physical activity."
+            );
+
+            results.push({ 
+                test: "Cholesterol", 
+                value: val, 
+                unit: extractedData.cholesterol.unit || "mg/dL",
+                status, 
+                explanation: `Your cholesterol is ${status.toLowerCase()}.`,
+                meaning,
+                advice
+            });
+        }
+
+        if (results.length === 0) {
+            summary = "No common medical markers (Hemoglobin, Glucose, Cholesterol) were detected in the report.";
+        } else {
+            summary = results.map(r => `${r.test}: ${r.explanation}`).join('\n');
         }
 
         res.json({ tests: results, overallSummary: summary });
@@ -105,25 +232,44 @@ app.post('/api/translate', async (req, res) => {
 // --- CHAT API ---
 app.post('/api/chat', async (req, res) => {
     try {
-        const { question } = req.body;
-        
+        const { question, language = 'en' } = req.body;
+        const langNames = { 'en': 'English', 'ta': 'Tamil', 'hi': 'Hindi' };
+        const targetLangName = langNames[language] || 'English';
+
+        let finalResponse = "";
+
         if (isGeminiConfigured) {
-            const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-            const prompt = `You are a helpful, simple AI health assistant. Answer this query in 1-2 short sentences: ${question}`;
-            const result = await model.generateContent(prompt);
-            const response = result.response.text();
-            res.json({ response });
-        } else {
-            // MOCK Fallback
-            let response = "I am an AI health assistant.";
-            const lw = question.toLowerCase();
-            if (lw.includes('bp') || lw.includes('blood pressure')) response = "Blood pressure is the force of your blood against artery walls. Normal is around 120/80.";
-            else if (lw.includes('sugar')) response = "High sugar can indicate diabetes. Avoid sugary foods and consult a doctor.";
-            else if (lw.includes('hemoglobin') || lw.includes('improve')) response = "Eat iron-rich foods like spinach, meat, and lentils to improve hemoglobin.";
-            else response = "I'm your AI health assistant. (Setup GEMINI_API_KEY in .env for real responses).";
-            
-            res.json({ response });
+            try {
+                const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+                const prompt = `You are a helpful AI health assistant. Respond strictly in ${targetLangName}. Answer this query in 1-2 short sentences: ${question}`;
+                const result = await model.generateContent(prompt);
+                finalResponse = result.response.text();
+            } catch (geminiError) {
+                console.error("Gemini Chat Error (Falling back to mock):", geminiError.message);
+                // Fall through to mock logic
+            }
         }
+        
+        if (!finalResponse) {
+            // MOCK Fallback / Safe Mode
+            const lw = question.toLowerCase();
+            if (lw.includes('bp') || lw.includes('blood pressure')) finalResponse = "Blood pressure is the force of your blood against artery walls. Normal is around 120/80.";
+            else if (lw.includes('glucose') || lw.includes('sugar')) finalResponse = "High sugar can indicate diabetes. Avoid sugary foods and consult a doctor.";
+            else if (lw.includes('hemoglobin') || lw.includes('iron')) finalResponse = "Eat iron-rich foods like spinach, meat, and lentils to improve hemoglobin.";
+            else finalResponse = "I am your AI health assistant. Currently, I'm in safe-mode but here to help with general questions.";
+        }
+
+        // Apply Final Translation layer if not English
+        if (language !== 'en') {
+            try {
+                finalResponse = await translate(finalResponse, { to: language });
+            } catch (transError) {
+                console.error("Chat Translation Error:", transError);
+                // Keep the English response as absolute last resort
+            }
+        }
+        
+        res.json({ response: finalResponse });
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: 'Chat failed.' });
@@ -198,6 +344,41 @@ app.get('/api/glucose', async (req, res) => {
         });
     } catch (error) {
         res.status(500).json({ error: 'Failed to fetch glucose readings.' });
+    }
+});
+
+
+
+// --- MOCK DB ---
+const mockUsers = [];
+
+// --- MOCK AUTH ROUTES ---
+app.post('/api/register', async (req, res) => {
+    const { email, password, fullName } = req.body;
+    console.log(`Registering user: ${fullName} (${email})`);
+    mockUsers.push({ email, password, fullName });
+    res.json({ success: true, message: "Account created successfully!" });
+});
+
+app.post('/api/login', async (req, res) => {
+    const { email, password, fullName } = req.body;
+    console.log(`Login attempt: ${email} (Name: ${fullName})`);
+    
+    // Find user in mock DB or use fallback
+    const existingUser = mockUsers.find(u => u.email === email);
+    
+    if (email && password) {
+        res.json({ 
+            success: true, 
+            token: "mock-jwt-token-xyz", 
+            user: { 
+                email, 
+                name: email.split('@')[0],
+                fullName: fullName || (existingUser ? existingUser.fullName : (email.split('@')[0]))
+            } 
+        });
+    } else {
+        res.status(401).json({ success: false, message: "Invalid credentials" });
     }
 });
 
